@@ -1,3 +1,4 @@
+
 # Progetto di Tesi – Frammentazione e traduzione delle interrogazioni SQL
 
 Questa cartella contiene il codice e gli script utilizzati per la parte pratica della tesi.  

@@ -1,15 +1,9 @@
--- ==========================================================
+
+
 -- Synthea core tables (PostgreSQL)
 -- patients, encounters, conditions, medications, observations
--- ==========================================================
 
--- Per sicurezza: crea uno schema dedicato (facoltativo)
--- CREATE SCHEMA IF NOT EXISTS synthea;
--- SET search_path TO synthea, public;
 
--- -----------------------
--- Drop in ordine FK-safe
--- -----------------------
 DROP TABLE IF EXISTS observations CASCADE;
 DROP TABLE IF EXISTS medications CASCADE;
 DROP TABLE IF EXISTS conditions CASCADE;
@@ -20,7 +14,7 @@ DROP TABLE IF EXISTS patients CASCADE;
 -- PATIENTS
 -- ===========
 CREATE TABLE patients (
-  id                   TEXT PRIMARY KEY,         -- UUID dal CSV
+  id                   TEXT PRIMARY KEY,
   birthdate            DATE,
   deathdate            DATE,
   ssn                  TEXT,
@@ -54,7 +48,7 @@ CREATE TABLE patients (
 -- ENCOUNTERS
 -- ===========
 CREATE TABLE encounters (
-  id                    TEXT PRIMARY KEY,        -- UUID dal CSV
+  id                    TEXT PRIMARY KEY,
   start                 TIMESTAMP WITHOUT TIME ZONE,
   "stop"                TIMESTAMP WITHOUT TIME ZONE,
   patient               TEXT REFERENCES patients(id),           -- FK → patients.id
@@ -76,12 +70,12 @@ CREATE TABLE encounters (
 -- ===========
 -- Il CSV di Synthea non ha "Id" per conditions: creiamo PK surrogata
 CREATE TABLE conditions (
-  id            SERIAL PRIMARY KEY,           -- surrogata
+  id            SERIAL PRIMARY KEY,
   start         TIMESTAMP WITHOUT TIME ZONE,
   "stop"        TIMESTAMP WITHOUT TIME ZONE,
   patient       TEXT REFERENCES patients(id),
-  encounter     TEXT REFERENCES encounters(id),                     -- FK → encounters.id (spesso presente)
-  system        TEXT,                            -- coding system (es. SNOMED/ICD)
+  encounter     TEXT REFERENCES encounters(id),                     -- FK → encounters.id
+  system        TEXT,
   code          TEXT,
   description   TEXT
 );
@@ -119,7 +113,7 @@ CREATE TABLE observations (
   category      TEXT,
   code          TEXT,
   description   TEXT,
-  value         TEXT,                            -- può essere numerico o testo; lasciamo TEXT
+  value         TEXT,
   units         TEXT,
   "type"        TEXT
 );
