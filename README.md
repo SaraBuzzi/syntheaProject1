@@ -16,8 +16,8 @@ Lo scopo principale è **simulare l’esecuzione di query su un database frammen
 - **Notebook Python** con esperimenti interattivi e test sulle query.  
   La traduzione delle interrogazioni è stata divisa in tre casi principali, ognuno gestito in un notebook dedicato:
   - **Query1**: interrogazioni del tipo `SELECT x FROM y WHERE c`  
-  - **Query2**: interrogazioni con clausola `GROUP BY`  
-  - **Query3**: interrogazioni con clausola `GROUP BY` e condizione in `HAVING`  
+  - **Query2**: interrogazioni con clausola `SELECT x FROM y GROUP BY x`  
+  - **Query3**: interrogazioni con clausola `SELECT x FROM y GROUP BY x HAVING c`  
 
 ---
 
@@ -38,7 +38,6 @@ Lo scopo principale è **simulare l’esecuzione di query su un database frammen
 ---
 
 ## Cose ancora da implementare
-- [ ] Aggiungere più dati al database 
-- [ ] Valutare l’inclusione (o esclusione) dei casi con esecuzione *parallel* (per ora implementato sono in 'Query1')
+- [ ] Aggiungere più dati al database
 - [ ] Costruire un set di query più ampio per testare le varie tipologie di interrogazioni  
 - [ ] Creare un’interfaccia minimale per lanciare query e visualizzare i risultati  
