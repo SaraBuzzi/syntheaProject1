@@ -16,8 +16,9 @@ Lo scopo principale è **simulare l’esecuzione di query su un database frammen
 - **Notebook Python** con esperimenti interattivi e test sulle query.  
   La traduzione delle interrogazioni è stata divisa in tre casi principali, ognuno gestito in un notebook dedicato:
   - **Query1**: interrogazioni del tipo `SELECT x FROM y WHERE c`  
-  - **Query2**: interrogazioni con clausola `SELECT x FROM y GROUP BY x`  
-  - **Query3**: interrogazioni con clausola `SELECT x FROM y GROUP BY x HAVING c`  
+  - **Query2**: interrogazioni con clausola `SELECT x FROM y GROUP BY x` 
+    - **Query2W**: interrogazioni con clausola `SELECT x FROM y WHERE c GROUP BY x` 
+  - **Query3**: interrogazioni con clausola `SELECT x FROM y WHERE c GROUP BY x HAVING c`  
 
 ---
 
