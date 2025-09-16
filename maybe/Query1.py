@@ -271,6 +271,36 @@ def evaluate_query(query: str,
 
     counts, sizes = {}, {}
 
+    wh = plan.get("Classificazione") or {}
+    Co, Cs = wh.get("Co", []), wh.get("Cs", [])
+    has_owner_filter = bool(Co)
+
+    if has_owner_filter and sk in ("server-owner", "server-only"):
+        # 1) Materializza Ro (solo id filtrati su owner)
+        join_o = " OR " if (wh.get("has_or") and not Cs and not wh.get("Cso")) else " AND "
+        # 1) probe su owner
+        qo_probe = f"SELECT o.id FROM owner.patients_owner o WHERE {join_o.join(Co)}"
+        utils.run(f"DROP TABLE IF EXISTS {ro_name}; CREATE TABLE {ro_name} AS {qo_probe};")
+        counts["ro"], sizes["ro"] = utils._count_table(ro_name), utils._size_table(ro_name)
+
+        # 2) Stima f_o reale
+        N_owner = utils._row_count_base("owner.patients_owner")
+        f_o_real = (counts["ro"] / max(N_owner, 1)) if N_owner else 1.0
+
+        # 3) Regola di flip (soglia fissa, semplice)
+        ALPHA = 0.5  # se l'owner lascia passare <=40% conviene partire da owner
+        if f_o_real <= ALPHA:
+            # rifai il plan in owner-first (owner-server)
+            alt = _replan_alternative(plan, Fo, Fs)  # abbiamo già fatto passare Co/Cs/Cso in alt
+            if alt and alt.get("Strategia") == "owner-server":
+                # sostituisci la strategia e il piano
+                plan.update({
+                    "Strategia": "owner-server",
+                    "Strategia_eff": "owner-server",
+                    "qs": alt["qs"], "qo": alt["qo"], "qso": alt["qso"]
+                })
+                sk = "owner-server"
+
     if sk == "owner-server":
         qo = utils._strip_semicolon(plan["qo"])
         qs = utils._strip_semicolon(plan["qs"])
