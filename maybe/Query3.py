@@ -1,14 +1,13 @@
 import re
-from typing import List, Set, Tuple, Dict, Any
+from typing import List, Set, Tuple, Dict, Optional, Any
 import os, uuid
 import pandas as pd
+from sqlalchemy import text
+
 import utils
 
 
-# SELECT FROM GROUP BY
-
-def parse_query_groupby(query: str) -> Tuple[Set[str], Set[str], List[Dict[str, Any]]]:
-
+def parse_query_groupby(query: str) -> Tuple[Set[str], Optional[str], Set[str], List[Dict[str, Any]], Optional[str]]:
     q = query.strip()
     m_sel = re.search(r"\bselect\s+(.*?)\s+from\b", q, re.I | re.S)
     if not m_sel:
@@ -16,51 +15,123 @@ def parse_query_groupby(query: str) -> Tuple[Set[str], Set[str], List[Dict[str, 
     sel_txt = m_sel.group(1)
     rest = q[m_sel.end():]
 
+    # --- NUOVO: individua anche HAVING (oltre a WHERE e GROUP BY) ---
+    markers = []   
+    for name, pat in [
+        ("where", r"\bwhere\b"),
+        ("group by", r"\bgroup\s+by\b"),
+        ("having", r"\bhaving\b"),
+        ("order by", r"\border\s+by\b"),
+        ("limit", r"\blimit\b"),
+    ]:
+        m = re.search(pat, rest, re.I)
+        if m:
+            markers.append((name, m.start(), m.end()))
+    markers.sort(key=lambda x: x[1])
 
-    m_gb = re.search(r"\bgroup\s+by\b", rest, re.I)
-
-
+    where_clause = None
     group_by_txt = None
-    if m_gb:
-        group_by_txt = rest[m_gb.end():].strip()
-        group_by_txt = re.sub(r';\s*$', '', group_by_txt, flags=re.S)
+    having_txt = None
 
-    # SELECT: separo plain vs aggregazioni
+    if markers:
+        for i, (name, s, e) in enumerate(markers):
+            nxt_start = markers[i + 1][1] if i + 1 < len(markers) else len(rest)
+            seg = rest[e:nxt_start].strip().rstrip(";").strip()
+            if name == "where":
+                where_clause = seg if seg else None
+            elif name == "group by":
+                group_by_txt = seg if seg else None
+            elif name == "having":
+                having_txt = seg if seg else None
+    else:
+        # nessun WHERE/GROUP BY/HAVING
+        pass
+
+    # --- SELECT: separo plain vs aggregazioni ---
     select_items = utils._split_outside_parents(sel_txt)
     select_plain: Set[str] = set()
     aggs: List[Dict[str, Any]] = []
 
-    agg_re = re.compile(
+    agg_re_full = re.compile(
         r"^(count|sum|avg|min|max)\s*\(\s*(distinct\s+)?(\*|[a-zA-Z_][\w\.]*)\s*\)\s*(?:as\s+([a-zA-Z_]\w*))?$",
         re.I
     )
     for it in select_items:
         it_norm = it.strip()
-        m = agg_re.match(it_norm)
+        m = agg_re_full.match(it_norm)
         if m:
             func = m.group(1).lower()
             distinct = bool(m.group(2))
             arg_raw = m.group(3)
             alias = m.group(4).lower() if m.group(4) else None
-            arg = None if arg_raw == '*' else utils._unqualify(arg_raw)
+            arg = None if arg_raw == "*" else utils._unqualify(arg_raw)
             aggs.append({"func": func, "arg": arg, "distinct": distinct, "alias": alias})
         else:
-
             select_plain.add(utils._unqualify(it_norm))
 
+    # --- GROUP BY: parse colonne ---
     group_by: Set[str] = set()
     if group_by_txt:
         cols = [tok for tok in utils._split_outside_parents(group_by_txt) if tok.strip()]
         group_by = {utils._unqualify(c) for c in cols}
 
-
+    # vincolo SQL: le non aggregate in SELECT devono stare nel GROUP BY
     if select_plain - group_by:
         missing = ", ".join(sorted(select_plain - group_by))
         raise ValueError(f"Le colonne non aggregate in SELECT devono apparire nel GROUP BY (manca: {missing}).")
 
-    return select_plain, group_by, aggs
+    # --- NUOVO: normalizzazione HAVING ---
+    # 1) espandi alias delle aggregazioni della SELECT dentro il HAVING
+    having_clause_norm = None
+    if having_txt:
+        alias_map = {}
+        for a in aggs:
+            if a.get("alias"):
+                canon = f"{a['func']}(" + ("distinct " if a["distinct"] else "")
+                canon += ("*" if a["arg"] is None else a["arg"]) + ")"
+                alias_map[a["alias"]] = canon
+        having_norm = having_txt
+        for alias, repl in alias_map.items():
+            having_norm = re.sub(rf"\b{re.escape(alias)}\b", repl, having_norm, flags=re.I)
+        having_clause_norm = having_norm.strip()
+
+        # 2) aggiungi alle aggregazioni anche quelle che compaiono SOLO nel HAVING
+        agg_finder = re.compile(
+            r"(count|sum|avg|min|max)\s*\(\s*(distinct\s+)?(\*|[a-zA-Z_][\w\.]*)\s*\)",
+            re.I
+        )
+        for m in agg_finder.finditer(having_clause_norm):
+            func = m.group(1).lower()
+            distinct = bool(m.group(2))
+            arg_raw = m.group(3)
+            arg = None if arg_raw == "*" else utils._unqualify(arg_raw)
+            if not any(a["func"] == func and a["arg"] == arg and a["distinct"] == distinct for a in aggs):
+                aggs.append({"func": func, "arg": arg, "distinct": distinct, "alias": None})
+
+    return select_plain, (where_clause or None), group_by, aggs, (having_clause_norm or None)
+
+def extract_conditions(where_clause: str) -> Tuple[List[str], bool]:
+    if " OR " in where_clause.upper():
+        conditions = [c.strip() for c in re.split(r"\bOR\b", where_clause, flags=re.IGNORECASE)]
+        return conditions, True
+    else:
+        conditions = [c.strip() for c in re.split(r"\bAND\b", where_clause, flags=re.IGNORECASE)]
+        return conditions, False
 
 
+def classify_conditions(conditions: List[str], Fo: Set[str], Fs: Set[str]) -> Dict[str, List[str]]:
+    Co, Cs, Cso = [], [], []
+    for cond in conditions:
+        attrs = {tok.lower() for tok in re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', cond)}
+        in_owner = attrs & Fo
+        in_server = attrs & Fs
+        if in_owner and in_server:
+            Cso.append(cond)
+        elif in_owner:
+            Co.append(cond)
+        elif in_server:
+            Cs.append(cond)
+    return {"Co": Co, "Cs": Cs, "Cso": Cso}
 
 
 
@@ -76,56 +147,95 @@ def classify_groupby_agg(group_by: Set[str], aggs: List[Dict[str, Any]],
         "Agg_owner": Agg_owner, "Agg_server": Agg_server,
     }
 
-def choose_strategy_groupby(classified: dict,
-                                   aggs: list[dict],
-                                   fo_table: str = "owner.patients_owner",
-                                   fs_table: str = "server.patients_server",
-                                   reduction_threshold: float = 0.2) -> str:
 
 
-    G_o, G_s = classified["G_owner"], classified["G_server"]
-    A_o, A_s = classified["Agg_owner"], classified["Agg_server"]
+def choose_strategy(classified, has_or, sel_attrs, Fo, Fs,
+                    table="patients",
+                    schema_owner="owner", schema_server="server",
+                    bytes_owner=1.0, bytes_server=1.0,
+                    groupby_info: dict | None = None,
+                    has_having: bool = False) -> str:
+    Co = classified.get("Co", [])
+    Cs = classified.get("Cs", [])
+    Cso = classified.get("Cso", [])
 
+    def _sel(preds: list[str], schema: str) -> float:
+        s = 1.0
+        for c in preds:
+            s *= max(min(utils.calcola_selettivita(schema, table, c), 1.0), 1e-6)
+        return s
 
-    if not G_s and not A_s:
-        return "owner-only"
-    if not G_o and not A_o:
-        return "server-only"
+    sel_owner = set()
+    sel_server = set()
+    if sel_attrs and Fo is not None and Fs is not None:
+        sel_owner = (set(a.lower() for a in sel_attrs) & set(x.lower() for x in Fo)) - {"id"}
+        sel_server = (set(a.lower() for a in sel_attrs) & set(x.lower() for x in Fs)) - {"id"}
 
-    if not G_o and G_s and A_o and not A_s:
-        N = utils._row_count_base(fs_table)
-        Gcount = utils._num_groups(fs_table, sorted(G_s)) if G_s else N
-        return "server-owner" if (Gcount / max(N, 1)) <= reduction_threshold else "owner-server"
+    # --- NOVITÀ: vincoli dovuti a GROUP BY / AGG (SELECT ∪ HAVING) ---
+    G_owner = set()
+    G_server = set()
+    Agg_owner = set()
+    Agg_server = set()
+    if groupby_info:
+        G_owner = set(groupby_info.get("G_owner", set()))
+        G_server = set(groupby_info.get("G_server", set()))
+        Agg_owner = set(groupby_info.get("Agg_owner", set()))
+        Agg_server = set(groupby_info.get("Agg_server", set()))
 
+    # Il server può "chiudere" la query senza passare dall'owner
+    # solo se: (a) nessun attributo selezionato sta su owner,
+    #          (b) nessuna chiave di GB né argomento di aggregazione sta su owner.
+    server_can_finish = (len(sel_owner) == 0) and (len(G_owner) == 0 and len(Agg_owner) == 0)
 
-    if not G_s and G_o and A_s and not A_o:
-        N = utils._row_count_base(fo_table)
-        Gcount = utils._num_groups(fo_table, sorted(G_o)) if G_o else N
-        return "owner-server" if (Gcount / max(N, 1)) <= reduction_threshold else "server-owner"
+    # Simmetrico per l'owner: può chiudere solo se non ha bisogno di nulla dal server
+    owner_can_finish = (len(sel_server) == 0) and (len(G_server) == 0 and len(Agg_server) == 0)
 
-    score = []
-    if G_o:
-        N_o = utils._row_count_base(fo_table)
-        Go = utils._num_groups(fo_table, sorted(G_o))
-        score.append(("owner-first", Go / max(N_o, 1)))
-    if G_s:
-        N_s = utils._row_count_base(fs_table)
-        Gs = utils._num_groups(fs_table, sorted(G_s))
-        score.append(("server-first", Gs / max(N_s, 1)))
+    # --- CASO con predicati misti in WHERE (Cso): serve ricomposizione ---
+    if Cso:
+        if Co and not Cs:
+            f_o = _sel(Co, schema_owner)
+            cost_os = f_o * (bytes_server + bytes_owner)
+            cost_so = bytes_server
+            return "owner-server" if cost_os < cost_so else "server-owner"
 
-    if score:
-     best = min(score, key=lambda x: x[1])
-     if best[1] <= reduction_threshold:
-        return "owner-server" if best[0] == "owner-first" else "server-owner"
+        if Cs and not Co:
+            return "server-owner"
 
-    owner_weight = len(G_o) + len(A_o)
-    server_weight = len(G_s) + len(A_s)
-    if owner_weight > server_weight:
-      return "owner-server"
-    if server_weight > owner_weight:
+        if Co and Cs:
+            f_o = _sel(Co, schema_owner)
+            f_s = _sel(Cs, schema_server)
+            cost_os = f_o * (bytes_server + bytes_owner)
+            cost_so = f_s * bytes_server
+            return "owner-server" if cost_os < cost_so else "server-owner"
+
         return "server-owner"
 
-    return "parallel"
+    # --- WHERE con OR: mantieni logica ma evita *-only se HAVING/GB richiedono l'altro lato ---
+    if has_or:
+        if Co and Cs:
+            return "parallel"
+        if Co:
+            # "owner-only" solo se non richiede nulla dal server (GB/Agg/SELECT)
+            return "owner-only" if owner_can_finish else "owner-server"
+        if Cs:
+            # "server-only" solo se non richiede nulla dall'owner (GB/Agg/SELECT)
+            return "server-only" if server_can_finish else "server-owner"
+        return "unknown"
+
+    # --- WHERE senza OR ---
+    if Co and not Cs:
+        return "owner-only" if owner_can_finish else "owner-server"
+    if Cs and not Co:
+        return "server-only" if server_can_finish else "server-owner"
+    if Co and Cs:
+        f_o = _sel(Co, schema_owner)
+        f_s = _sel(Cs, schema_server)
+        cost_o = f_o * (bytes_owner + bytes_server)
+        cost_s = f_s * (bytes_owner + bytes_server)
+        print(f_o, f_s, cost_o, cost_s)
+        return "owner-server" if cost_o < cost_s else "server-owner"
+
+    return "unknown"
 
 
 def render_aggs_sql(aggs: List[Dict[str, Any]], Fo: Set[str]) -> str:
@@ -147,9 +257,17 @@ def render_aggs_sql(aggs: List[Dict[str, Any]], Fo: Set[str]) -> str:
 
 def generate_subqueries_gb(
         select_plain: Set[str], group_by: Set[str], aggs: List[Dict[str, Any]],
-        Fo: Set[str], Fs: Set[str], strategy: str
+        Fo: Set[str], Fs: Set[str], strategy: str,
+        Co: List[str] = None, Cs: List[str] = None, Cso: List[str] = None, has_or: bool = False,
+        having_clause: str | None = None
 ) -> Tuple[str | None, str | None, str | None]:
 
+    Co = Co or []
+    Cs = Cs or []
+    Cso = Cso or []
+
+    join_o = " OR " if (has_or and not Cs and not Cso) else " AND "
+    join_s = " OR " if (has_or and not Co and not Cso) else " AND "
 
     sel_plain = {c.lower() for c in select_plain}
     gb = {c.lower() for c in group_by}
@@ -163,10 +281,8 @@ def generate_subqueries_gb(
 
     gb_owner = [f"o.{c}" for c in sorted(gb & Fo)]
     gb_server = [f"s.{c}" for c in sorted(gb & Fs)]
-
-    gb_sql_owner = ", ".join(gb_owner)
-    gb_sql_server = ", ".join(gb_server)
-    gb_sql = ", ".join(gb_owner + gb_server)
+    gb_all = gb_owner + gb_server
+    gb_sql = ", ".join(gb_all)
 
     aggs_sql = render_aggs_sql(aggs, Fo)
     select_parts = []
@@ -176,57 +292,96 @@ def generate_subqueries_gb(
         select_parts.append(aggs_sql)
     final_select = ", ".join(select_parts) if select_parts else aggs_sql
 
+    # HAVING: da aggiungere SOLO sulla query che fa il GROUP BY/aggregazioni
+    having_sql = f" HAVING {having_clause}" if having_clause else ""
+
     qs = qo = qso = None
 
     if strategy == "server-owner":
-
         proj_qs = ", ".join(["s.id"] + [f"s.{c}" for c in Aqs])
         qs = f"SELECT {proj_qs} FROM server.patients_server s"
-        if gb_sql_server:
-            qs += f" ORDER BY {gb_sql_server}"
+        if Cs:
+            qs += f" WHERE {join_s.join(Cs)}"
 
+        # JOIN + (Co, Cso) a valle + GROUP BY (+ HAVING)
         qso = f"SELECT {final_select} FROM owner.patients_owner o JOIN Rs s USING (id)"
+        where_parts = []
+        if Co:
+            where_parts.append(join_o.join(Co))
+        if Cso:
+            where_parts.append(" AND ".join(Cso))  # Cso sempre dopo join
+        if where_parts:
+            qso += " WHERE " + " AND ".join([p for p in where_parts if p])
         if gb_sql:
             qso += f" GROUP BY {gb_sql}"
+        if having_clause:
+            qso += having_sql  # HAVING valutata lato owner
 
     elif strategy == "owner-server":
-
         qo = "SELECT o.id FROM owner.patients_owner o"
-
+        if Co:
+            qo += f" WHERE {join_o.join(Co)}"
 
         proj_qs = ", ".join(["s.id"] + [f"s.{c}" for c in Aqs])
         qs = f"SELECT {proj_qs} FROM server.patients_server s JOIN Ro r USING (id)"
+        if Cs:
+            qs += f" WHERE {join_s.join(Cs)}"
 
+        # JOIN finale + Cso + GROUP BY (+ HAVING)
         qso = f"SELECT {final_select} FROM owner.patients_owner o JOIN Rs s USING (id)"
+        if Cso:
+            qso += " WHERE " + " AND ".join(Cso)
         if gb_sql:
             qso += f" GROUP BY {gb_sql}"
+        if having_clause:
+            qso += having_sql
 
     elif strategy == "owner-only":
-
         needs_server = bool(((sel_plain | gb | agg_args) & Fs))
         if needs_server:
             qo = "SELECT o.id FROM owner.patients_owner o"
+            if Co:
+                qo += f" WHERE {join_o.join(Co)}"
             proj_qs = ", ".join(["s.id"] + [f"s.{c}" for c in Aqs])
             qs = f"SELECT {proj_qs} FROM server.patients_server s JOIN Ro r USING (id)"
+            if Cs:
+                qs += f" WHERE {join_s.join(Cs)}"
             qso = f"SELECT {final_select} FROM owner.patients_owner o JOIN Rs s USING (id)"
+            where_parts = []
+            if Cso:
+                where_parts.append(" AND ".join(Cso))
+            if where_parts:
+                qso += " WHERE " + " AND ".join(where_parts)
             if gb_sql:
                 qso += f" GROUP BY {gb_sql}"
+            if having_clause:
+                qso += having_sql
         else:
-
+            # tutto su owner → GROUP BY (+ HAVING) su owner
             qo = f"SELECT {final_select} FROM owner.patients_owner o"
+            if Co:
+                qo += f" WHERE {join_o.join(Co)}"
             if gb_sql:
                 qo += f" GROUP BY {gb_sql}"
+            if having_clause:
+                qo += having_sql
 
     elif strategy == "server-only":
-
         needs_owner = bool(((sel_plain | gb | agg_args) & Fo))
         if needs_owner:
             proj_qs = ", ".join(["s.id"] + [f"s.{c}" for c in Aqs])
             qs = f"SELECT {proj_qs} FROM server.patients_server s"
+            if Cs:
+                qs += f" WHERE {join_s.join(Cs)}"
             qso = f"SELECT {final_select} FROM owner.patients_owner o JOIN Rs s USING (id)"
+            if Cso:
+                qso += " WHERE " + " AND ".join(Cso)
             if gb_sql:
                 qso += f" GROUP BY {gb_sql}"
+            if having_clause:
+                qso += having_sql
         else:
+            # tutto su server → GROUP BY (+ HAVING) su server
             gb_only_s = ", ".join([f"s.{c}" for c in sorted(gb & Fs)])
             aggs_sql_s = render_aggs_sql(aggs, Fo)
             parts = []
@@ -236,27 +391,38 @@ def generate_subqueries_gb(
                 parts.append(aggs_sql_s)
             final_s = ", ".join(parts) if parts else aggs_sql_s
             qs = f"SELECT {final_s} FROM server.patients_server s"
+            if Cs:
+                qs += f" WHERE {join_s.join(Cs)}"
             if gb_only_s:
                 qs += f" GROUP BY {gb_only_s}"
+            if having_clause:
+                qs += having_sql  # HAVING sul server
 
     elif strategy == "parallel":
-
+        # estrazioni minime con pushdown Co/Cs
         proj_qo = ", ".join(["o.id"] + [f"o.{c}" for c in Aqo]) if Aqo else "o.id"
         qo = f"SELECT {proj_qo} FROM owner.patients_owner o"
-
+        if Co:
+            qo += f" WHERE {' OR '.join(Co) if has_or else ' AND '.join(Co)}"
 
         proj_qs = ", ".join(["s.id"] + [f"s.{c}" for c in Aqs]) if Aqs else "s.id"
         qs = f"SELECT {proj_qs} FROM server.patients_server s"
+        if Cs:
+            qs += f" WHERE {' OR '.join(Cs) if has_or else ' AND '.join(Cs)}"
 
-
+        # join + Cso + GROUP BY (+ HAVING)
         qso = (
             "SELECT " + final_select +
             " FROM owner.patients_owner o"
             " JOIN Ro r USING (id)"
             " JOIN Rs s USING (id)"
         )
+        if Cso:
+            qso += " WHERE " + " AND ".join(Cso)
         if gb_sql:
             qso += f" GROUP BY {gb_sql}"
+        if having_clause:
+            qso += having_sql
 
     else:
         raise ValueError("Strategy must be one of: server-owner, owner-server, owner-only, server-only, parallel")
@@ -265,42 +431,89 @@ def generate_subqueries_gb(
 
 def process_query_gb(query: str, Fo: Set[str], Fs: Set[str]) -> Dict[str, any]:
 
-    select_plain, group_by, aggs = parse_query_groupby(query)
+    # parse esteso: ora ritorna anche having_clause (alias già espansi)
+    select_plain, where_clause, group_by, aggs, having_clause = parse_query_groupby(query)
+
+    Co = Cs = Cso = []
+    has_or = False
+    if where_clause:
+        conditions, has_or = extract_conditions(where_clause)
+        classified_where = classify_conditions(conditions, Fo, Fs)
+        Co, Cs, Cso = classified_where["Co"], classified_where["Cs"], classified_where["Cso"]
+
+    # classif GB/AGG (aggs include anche quelle comparse solo in HAVING)
     classified_gb = classify_groupby_agg(group_by, aggs, Fo, Fs)
-    strategy_key = choose_strategy_groupby(classified_gb, aggs,
-                                       fo_table="owner.patients_owner",
-                                       fs_table="server.patients_server")
+    groupby_info = {
+        "G_owner": classified_gb.get("G_owner", set()),
+        "G_server": classified_gb.get("G_server", set()),
+        "Agg_owner": classified_gb.get("Agg_owner", set()),
+        "Agg_server": classified_gb.get("Agg_server", set()),
+    }
+
+    # attributi coinvolti in select/groupby/agg
+    sel_attrs = set(select_plain) | set(group_by) | {a["arg"] for a in aggs if a.get("arg")}
+
+    # scelta strategia: passa anche groupby_info e has_having
+    classified_where_for_strategy = {"Co": Co, "Cs": Cs, "Cso": Cso}
+    strategy_key = choose_strategy(
+        classified_where_for_strategy,
+        has_or,
+        sel_attrs,
+        Fo, Fs,
+        table="patients",
+        schema_owner="owner",
+        schema_server="server",
+        bytes_owner=1.0,
+        bytes_server=1.0,
+        groupby_info=groupby_info,
+        has_having=bool(having_clause)
+    )
     strategy_eff = strategy_key
 
+    # generazione subquery: propaga having_clause
     qs, qo, qso = generate_subqueries_gb(
-        select_plain=select_plain, group_by=group_by, aggs=aggs,
-        Fo=Fo, Fs=Fs, strategy=strategy_eff
+        select_plain=select_plain,
+        group_by=group_by,
+        aggs=aggs,
+        Fo=Fo, Fs=Fs,
+        strategy=strategy_eff,
+        Co=Co, Cs=Cs, Cso=Cso,
+        has_or=has_or,
+        having_clause=having_clause
     )
 
     return {
         "Query": query,
         "SELECT_PLAIN": select_plain,
+        "WHERE": where_clause,
         "GROUP_BY": group_by,
+        "HAVING": having_clause,
         "AGGS": aggs,
+        "Classificazione_WHERE": {"Co": Co, "Cs": Cs, "Cso": Cso, "has_or": has_or},
         "Classificazione_GB": classified_gb,
         "Strategia": strategy_key,
         "Strategia_eff": strategy_eff,
-        "qs": qs, "qo": qo, "qso": qso
+        "qs": qs, "qo": qo, "qso": qso,
     }
 
 def _replan_alternative_gb(plan: dict, Fo: set, Fs: set) -> dict | None:
-
     cur = plan.get("Strategia_eff") or plan.get("Strategia")
     alt = {"owner-server": "server-owner", "server-owner": "owner-server"}.get(cur)
     if not alt:
         return None
 
-
     qs, qo, qso = generate_subqueries_gb(
         select_plain=plan["SELECT_PLAIN"],
         group_by=plan["GROUP_BY"],
         aggs=plan["AGGS"],
-        Fo=Fo, Fs=Fs, strategy=alt
+        Fo=Fo,
+        Fs=Fs,
+        strategy=alt,
+        Co=plan.get("Classificazione_WHERE", {}).get("Co", []),
+        Cs=plan.get("Classificazione_WHERE", {}).get("Cs", []),
+        Cso=plan.get("Classificazione_WHERE", {}).get("Cso", []),
+        has_or=plan.get("Classificazione_WHERE", {}).get("has_or", False),
+        having_clause=plan.get("HAVING")  # <-- propagate HAVING
     )
     return {"Strategia": alt, "qs": qs, "qo": qo, "qso": qso}
 
@@ -360,10 +573,8 @@ def evaluate_query_gb(query: str,
             utils.run(f"DROP TABLE IF EXISTS {rs_name}; CREATE TABLE {rs_name} AS {qs_mat};")
             counts["rs"], sizes["rs"] = utils._count_table(rs_name), utils._size_table(rs_name)
 
-        #qso = _strip_semicolon(plan["qso"])
-        #qso_mat = qso.replace(" Rs ", f" {rs_name} ") if plan["qs"] else qso
-        #run(f"DROP TABLE IF EXISTS {out_name}; CREATE TABLE {out_name} AS {qso_mat};")
-        #counts["out"], sizes["out"] = _count_table(out_name), _size_table(out_name)
+
+
 
     elif sk == "parallel":
         # materializza entrambi i lati, poi la query finale che li usa entrambi
@@ -480,6 +691,3 @@ def evaluate_queries_gb(queries: list[str],
                                 save_to=save_to, also_compare_alt=also_compare_alt)
         rows.append(res["row"])
     return pd.DataFrame(rows)
-
-
-

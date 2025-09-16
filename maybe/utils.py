@@ -1,12 +1,16 @@
 import re
+from pathlib import Path
 from typing import List
 
+import pandas as pd
 from sqlalchemy import text
 from db_conn import run
 
 
 # utils
 def _strip_semicolon(sql: str) -> str:
+    if sql is None:
+        return None
     return re.sub(r';\s*$', '', sql.strip())
 
 def _subst_token(sql: str, token: str, replacement: str) -> str:
@@ -69,7 +73,7 @@ def domini_from_pg_stats(schema: str, table: str) -> dict:
     JOIN pg_namespace n ON n.oid = c.relnamespace AND n.nspname = s.schemaname
     WHERE s.schemaname = :schema AND s.tablename = :table;
     """
-    rows = run(text(sql).bindparams(schema=schema, table=table), show=False)
+    rows = run(text(sql).bindparams(schema=schema, table=table))
     return {r.col.lower(): max(1, int(r.est_distinct or 1)) for _, r in rows.iterrows()}
 
 
@@ -100,7 +104,7 @@ def calcola_selettivita(schema: str, table: str, condizione: str,
         FROM {schema}.{table}_{schema};
     """
 
-    row = run(text(sql), show=False).iloc[0]
+    row = run(text(sql)).iloc[0]
     total = float(row["total"])
     match = float(row["match"])
     if total <= 0:
@@ -154,4 +158,40 @@ def _num_groups(table_qual: str, keys: list[str]) -> int:
     cols = ", ".join(keys)
     df = run(f"SELECT COUNT(*) AS g FROM (SELECT DISTINCT {cols} FROM {table_qual}) t;")
     return int(df.iloc[0]["g"])
+
+
+def _load_output(obj, preview_limit: int = 1000) -> pd.DataFrame:
+    # 1) Già DataFrame
+    if isinstance(obj, pd.DataFrame):
+        return obj
+
+    # 2) Stringa o Path
+    if isinstance(obj, (str, Path)):
+        s = str(obj)
+
+        # 2a) File (csv/tsv/parquet)
+        p = Path(s)
+        suf = p.suffix.lower()
+        if suf == ".parquet":
+            return pd.read_parquet(p)
+        if suf in {".tsv", ".txt"}:
+            return pd.read_table(p)
+        if suf == ".csv":
+            return pd.read_csv(p)
+
+        # 2b) schema.tabella
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*\.[A-Za-z_][A-Za-z0-9_]*", s):
+            df = run(f"SELECT * FROM {s} LIMIT {int(preview_limit)}")
+            return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+        # 2c) SELECT grezza
+        if s.strip().lower().startswith("select"):
+            df = run(s)
+            return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    # 3) Fallback: prova a costruire un DF
+    try:
+        return pd.DataFrame(obj)
+    except Exception:
+        return pd.DataFrame()
 

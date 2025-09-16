@@ -8,7 +8,6 @@ import pandas as pd
 import utils
 
 
-
 # SELECT FROM WHERE
 def parse_query(query: str) -> Tuple[Set[str], str]:
     select_match = re.search(r"SELECT\s+(.*?)\s+FROM", query, flags=re.IGNORECASE | re.DOTALL)
@@ -297,7 +296,7 @@ def evaluate_query(query: str,
 
         utils.run(f"DROP TABLE IF EXISTS {rs_name}; CREATE TABLE {rs_name} AS {qs};")
         counts["rs"] = utils._count_table(rs_name)
-        sizes["rs"] =utils._size_table(rs_name)
+        sizes["rs"] = utils._size_table(rs_name)
 
         qso_mat = qso.replace(" Rs ", f" {rs_name} ")
         utils.run(f"DROP TABLE IF EXISTS {out_name}; CREATE TABLE {out_name} AS {qso_mat};")
@@ -305,10 +304,17 @@ def evaluate_query(query: str,
         sizes["out"] = utils._size_table(out_name)
 
     elif sk in ("owner-only", "server-only"):
-        qso = utils._strip_semicolon(plan["qso"])
-        utils.run(f"DROP TABLE IF EXISTS {out_name}; CREATE TABLE {out_name} AS {qso};")
-        counts["out"] = utils._count_table(out_name)
-        sizes["out"] = utils._size_table(out_name)
+
+        if sk == "owner-only":
+            qo = utils._strip_semicolon(plan["qo"])
+            utils.run(f"DROP TABLE IF EXISTS {ro_name}; CREATE TABLE {ro_name} AS {qo};")
+            counts["ro"] = utils._count_table(ro_name)
+            sizes["ro"] = utils._size_table(ro_name)
+        elif sk == "server-only":
+            qs = utils._strip_semicolon(plan["qs"])
+            utils.run(f"DROP TABLE IF EXISTS {rs_name}; CREATE TABLE {rs_name} AS {qs};")
+            counts["rs"] = utils._count_table(rs_name)
+            sizes["rs"] = utils._size_table(rs_name)
 
     elif sk == "parallel":
         if plan["qo"]:
